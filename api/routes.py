@@ -16190,6 +16190,19 @@ def handle_post(handler, parsed) -> bool:
                 SESSIONS[copied_session.session_id] = copied_session
                 SESSIONS.move_to_end(copied_session.session_id)
                 _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+            # #4765 follow-up (CoT side-store): the duplicate's messages carry
+            # _has_cot markers whose reasoning text lives in the SOURCE
+            # session's .cot store. Copy that store to the new id before the
+            # first save, or the duplicate's thinking cards would 404 on
+            # expand and provider replay would lose the historical CoT.
+            try:
+                from api import cot_store
+                cot_store.copy_store(SESSION_DIR, sid, copied_session.session_id)
+            except Exception:
+                logger.debug(
+                    "CoT side-store copy failed for duplicate %s -> %s",
+                    sid, copied_session.session_id, exc_info=True,
+                )
             # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
             # accidentally avoided this because `/api/session/rename` calls `s.save()`.
             # Without this explicit save, the duplicate is in-memory only — if the user

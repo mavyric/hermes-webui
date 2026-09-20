@@ -292,3 +292,24 @@ def remove(session_dir: Path, session_id: str) -> None:
                 os.unlink(p)
         except OSError:
             pass
+
+
+def copy_store(session_dir: Path, src_session_id: str, dst_session_id: str) -> bool:
+    """Copy a whole side store from one session id to another (best effort).
+
+    Used when messages carrying ``_has_cot`` markers are moved into a new
+    session id (e.g. ``/api/session/duplicate``): the destination store is
+    rebuilt by copying the source ``.cot``/``.cot.idx`` pair so the records
+    (keyed by message position) stay addressable. Returns True when a store
+    was copied, False when the source had none.
+    """
+    src_cot, src_idx = _paths(session_dir, src_session_id)
+    dst_cot, dst_idx = _paths(session_dir, dst_session_id)
+    if not (src_cot.exists() and src_idx.exists()):
+        return False
+    try:
+        _write_atomic(dst_cot, src_cot.read_bytes())
+        _write_atomic(dst_idx, src_idx.read_bytes())
+        return True
+    except OSError:
+        return False

@@ -18182,8 +18182,8 @@ function renderMessages(options){
         if(m._activityBurstId!==undefined&&m._activityBurstId!==null) orderedSeg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
         if(Number.isFinite(Number(m._liveSegmentSeq))) orderedSeg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
         if(_ERR_MSG_RE.test(String(partDisplayText||'').trim())) orderedSeg.dataset.error='1';
-        if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))){
-          orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+        if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))) orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+        {
           const _ocEl=orderedSeg.querySelector('.thinking-card');
           if(_ocEl&&typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(thinkingText)){
             const _ocAbs=_cotLazyAbsIndex(thinkingText, rawIdx);
@@ -18255,13 +18255,11 @@ function renderMessages(options){
     }
     if(thinkingText&&window._showThinking!==false){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
-      else if(window._showThinking!==false){
-        const _thCard=seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
-        const _thCardEl=seg.querySelector('.thinking-card');
-        if(_thCardEl&&typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(thinkingText)){
-          const _cotAbs=_cotLazyAbsIndex(thinkingText, rawIdx);
-          if(_cotAbs!==null) _stampCotLazyThinkingCard(_thCardEl, _cotAbs);
-        }
+      else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+      const _thCardEl=seg.querySelector('.thinking-card');
+      if(_thCardEl&&typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(thinkingText)){
+        const _cotAbs=_cotLazyAbsIndex(thinkingText, rawIdx);
+        if(_cotAbs!==null) _stampCotLazyThinkingCard(_thCardEl, _cotAbs);
       }
     }
     const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);

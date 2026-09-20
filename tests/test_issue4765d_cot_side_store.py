@@ -278,6 +278,33 @@ def test_reasoning_endpoint_reads_side_store(reasoning_route_env, monkeypatch):
     assert body["reasoning"] == {"1": "the-stored-cot", "2": "second-cot"}
 
 
+def test_copy_store_migrates_cot_across_session_ids():
+    """Duplicate/fork path: CoT text follows messages moved to a new id.
+
+    Regression guard for the /api/session/duplicate gap — messages carrying
+    _has_cot markers reference records in the SOURCE session's store; without
+    copy_store the destination session's thinking cards 404 on expand.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        src, dst = "src-round", "dst-round"
+        n = cot_store.write_full(d, src, [
+            _msg("user", "q"),
+            _msg("assistant", "", "carried thought"),
+            _msg("assistant", "a"),
+        ])
+        assert n == 3
+        assert cot_store.read_records(d, src, [1]) == {1: "carried thought"}
+        # Before the copy the destination store has no records.
+        assert cot_store.read_records(d, dst, [1]) == {}
+        assert cot_store.copy_store(d, src, dst) is True
+        assert cot_store.read_records(d, dst, [1]) == {1: "carried thought"}
+        # Source store is untouched (a copy, not a move).
+        assert cot_store.read_records(d, src, [1]) == {1: "carried thought"}
+        # Copying a store that does not exist is a clean no-op.
+        assert cot_store.copy_store(d, "absent", "empty") is False
+
+
 def test_reasoning_endpoint_requires_session_id(reasoning_route_env):
     from api import routes
     from urllib.parse import ParseResult

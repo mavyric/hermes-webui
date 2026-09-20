@@ -124,9 +124,12 @@ def test_sanitize_messages_for_api_drops_reasoning_only_display_entries():
 
     sanitized = _sanitize_messages_for_api(messages)
 
+    # #4765 follow-up: reasoning is projected to reasoning_content for
+    # model-facing replay (so providers that support CoT see it); rows that
+    # carry ONLY reasoning (no visible content, partial tool state) are dropped.
     assert sanitized == [
         {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "visible answer"},
+        {"role": "assistant", "content": "visible answer", "reasoning_content": "display metadata"},
     ]
 
 

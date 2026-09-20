@@ -381,7 +381,20 @@ def _identity_hole_history(successor_id) -> tuple[list[dict], list[dict]]:
 
 
 def _reasoning_cards(messages) -> list:
-    return [m.get("reasoning") for m in messages]
+    # CoT-card presence per message, normalized to a single token so the
+    # geometric invariant (exactly one historical card at the anchor, not 0 /
+    # not 2) is era-agnostic: an inline reasoning string (pre-side-store) and
+    # the lazy ``_has_cot`` marker (post-side-store) both normalize to "_card".
+    out = []
+    for m in messages:
+        r = m.get("reasoning")
+        if isinstance(r, str) and r.strip():
+            out.append("_card")
+        elif m.get("_has_cot"):
+            out.append("_card")
+        else:
+            out.append(None)
+    return out
 
 
 def _settled_session(monkeypatch, display, context, result_ids=()):
@@ -402,7 +415,7 @@ def _settled_session(monkeypatch, display, context, result_ids=()):
 
 
 # The new "continue" is a distinct turn: exactly one historical card may survive.
-_ONE_CARD = [None, None, "historical card", None, None, None, None]
+_ONE_CARD = [None, None, "_card", None, None, None, None]
 
 
 def test_bool_successor_id_never_matches_integer_one(monkeypatch):
@@ -489,7 +502,9 @@ def _isolated_session_store(tmp_path, monkeypatch):
 
 def test_idless_successor_card_survives_settle_save_load(tmp_path, monkeypatch):
     """Persisted-display pin: the helper-level id skip never drops the card."""
-    _isolated_session_store(tmp_path, monkeypatch)
+    from api import cot_store
+
+    sessions = _isolated_session_store(tmp_path, monkeypatch)
     display, context = _identity_hole_history(None)
     del display[3]["id"]  # legacy transcript: successor predates stable ids
     context = [copy.deepcopy(display[-2]), copy.deepcopy(display[-1])]
@@ -501,11 +516,18 @@ def test_idless_successor_card_survives_settle_save_load(tmp_path, monkeypatch):
 
     session, result = _settled_session(monkeypatch, loaded.messages, loaded.context_messages)
     assert result[0]["id"] is not None  # minted before restore: helper-level skip applies
+    # Settle rewrites under a fresh session id; carry the CoT store across,
+    # exactly as /api/session/duplicate does (CoT text is keyed by message
+    # position in the source session's .cot store).
+    cot_store.copy_store(sessions, "e" * 12, session.session_id)
     session.save()
     reloaded = Session.load("b" * 12)
     assert reloaded is not None
     assert _reasoning_cards(reloaded.messages) == _ONE_CARD
-    assert reloaded.messages[2]["reasoning"] == "historical card"
+    # #4765 follow-up: the card's text now lives in the side store; the
+    # reloaded row carries the lazy marker that renders the thinking card.
+    assert reloaded.messages[2].get("_has_cot") is True
+    assert cot_store.read_records(sessions, "b" * 12, [2]).get(2) == "historical card"
     assert [m["content"] for m in reloaded.messages[-2:]] == ["continue", "new answer"]
 
 

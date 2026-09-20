@@ -110,10 +110,21 @@ def test_restart_recovery_preserves_display_reasoning_without_provider_replay(
         "The first boundary is the live stream.",
         "The journal still has the emitted work.",
     ]
-    assert [message.get("reasoning") for message in recovered] == [
-        "Checking the first failure boundary.",
-        "Comparing the journal with the session sidecar.",
+    # #4765 follow-up: recovered display reasoning is persisted lazily in the
+    # CoT side store; each recovered row carries the marker that renders the
+    # thinking card, and the text is addressable by message index.
+    assert all(message.get("_has_cot") is True for message in recovered)
+    from api import cot_store
+
+    _recovered_idx = [
+        i for i, message in enumerate(reloaded.messages)
+        if message in recovered
     ]
+    _records = cot_store.read_records(
+        models.SESSION_DIR, session_id, _recovered_idx,
+    )
+    assert _records.get(_recovered_idx[0]) == "Checking the first failure boundary."
+    assert _records.get(_recovered_idx[1]) == "Comparing the journal with the session sidecar."
     assert reloaded.tool_calls[0]["name"] == "terminal"
     assert reloaded.tool_calls[0]["done"] is True
     assert any(
