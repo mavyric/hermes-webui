@@ -1,0 +1,64 @@
+# Keeps mavyric/hermes-webui master tracking nesquena/hermes-webui.
+#
+# - up to date   -> no-op
+# - pure ff      -> ff-merge upstream/master, push
+# - local commits -> rebase them onto upstream/master, force-with-lease push
+# - rebase conflict -> job fails, fork master is left untouched
+#
+# Runs daily (08:30 CEST) via schedule and on-demand via "Run workflow".
+# Fork-local by design: no secrets beyond the built-in GITHUB_TOKEN.
+name: sync-with-upstream
+
+on:
+  schedule:
+    # 08:30 CEST == 06:30 UTC
+    - cron: '30 6 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-with-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/nesquena/hermes-webui.git
+          git fetch upstream --prune
+
+      - name: Sync master with upstream/master
+        run: |
+          set -euo pipefail
+          git config user.name "mavyric[bot]"
+          git config user.email "mavyric[bot]@users.noreply.github.com"
+          BEHIND=$(git rev-list --count master..upstream/master)
+          AHEAD=$(git rev-list --count upstream/master..master)
+          echo "upstream ahead: $BEHIND, local ahead: $AHEAD"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "up to date"
+            exit 0
+          fi
+          if [ "$AHEAD" -eq 0 ]; then
+            git merge --ff-only upstream/master
+          else
+            # Replay fork-local commits onto current mainline.
+            # Conflict -> rebase fails -> job red, nothing pushed.
+            git rebase upstream/master
+            echo "rebased $AHEAD local commit(s) onto upstream/master"
+          fi
+          # Cheap sanity: the three files the OOM patch touched compile.
+          python3 -m py_compile api/models.py api/streaming.py api/config.py
+          # force-with-lease: single pusher on this personal fork; needed
+          # because a rebase rewrites our commit hashes.
+          git push --force-with-lease origin master
+          echo "synced to $(git log -1 --format='%h' master)"
