@@ -6175,6 +6175,19 @@ def _sanitize_messages_for_api(
             sanitized.pop("api_content", None)
         elif not isinstance(sanitized.get("api_content"), str) or not sanitized.get("api_content"):
             sanitized.pop("api_content", None)
+        # #4765 follow-up (CoT dedup): the sidecar now stores reasoning once, in
+        # the display-canonical ``reasoning`` field. Providers that replay
+        # historical CoT read the ``reasoning_content`` alias (in
+        # _API_SAFE_MSG_KEYS), so project it from ``reasoning`` when the alias
+        # isn't present — keeping the model-facing history identical to the
+        # pre-dedup layout.
+        if (
+            msg.get('role') == 'assistant'
+            and 'reasoning_content' not in sanitized
+            and isinstance(msg.get('reasoning'), str)
+            and msg['reasoning'].strip()
+        ):
+            sanitized['reasoning_content'] = msg['reasoning']
         # Drop empty tool_calls — strict providers (DeepSeek, newer OpenAI)
         # reject tool_calls: [] with HTTP 400 even when no orphaned calls exist.
         if 'tool_calls' in sanitized and not sanitized['tool_calls']:
@@ -6321,6 +6334,16 @@ def _api_safe_message_positions(messages):
             [sanitized],
             message_records=True,
         )[0]
+        # #4765 follow-up (CoT dedup): project reasoning_content from the
+        # display-canonical reasoning field for provider replay (see the sibling
+        # projection in _sanitize_messages_for_api).
+        if (
+            msg.get('role') == 'assistant'
+            and 'reasoning_content' not in sanitized
+            and isinstance(msg.get('reasoning'), str)
+            and msg['reasoning'].strip()
+        ):
+            sanitized['reasoning_content'] = msg['reasoning']
         if 'tool_calls' in sanitized and not sanitized['tool_calls']:
             del sanitized['tool_calls']
         if is_recovered:

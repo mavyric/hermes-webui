@@ -1256,6 +1256,39 @@ def _load_session_from_path(path: Path) -> "Session | None":
     return Session(**data)
 
 
+def _existing_sidecar_message_count(path: Path) -> int:
+    """Return the on-disk sidecar's ``message_count`` WITHOUT parsing the full file.
+
+    ``save()`` previously read the ENTIRE sidecar and ``json.loads``-ed it just to
+    recover the existing message count for the #1558 backup guard. For a multi-GiB
+    sidecar (a long inference session's messages array) that is a full parse — a
+    peak-memory and CPU hit on EVERY save of that session, and a recurring OOM
+    contributor (#4765 follow-up). The authoritative ``message_count`` is written
+    in the small metadata prefix (BEFORE the messages array) by save(), so it can
+    be recovered from the cheap prefix read that ``load_metadata_only()`` uses.
+
+    Returns:
+        * the int ``message_count`` when the prefix carries one;
+        * ``-1`` when the sidecar is absent/empty or the count is absent/corrupt
+          (a legacy layout predating the prefix count) — callers treat -1 as
+          "unknown", which is the conservative signal that forces the full-file
+          read in the rare shrink case that must write a .bak.
+    """
+    try:
+        if not path.exists():
+            return -1
+        prefix = _read_metadata_json_prefix(path)
+        if not prefix:
+            return -1
+        parsed = json.loads(prefix)
+        if not isinstance(parsed, dict):
+            return -1
+        count = _parse_nonnegative_int(parsed.get('message_count'))
+        return count if count is not None else -1
+    except Exception:
+        return -1
+
+
 def _lookup_index_message_count(session_id):
     """Return the indexed message count without loading the full session file."""
     return _index_message_count_map().get(str(session_id))
@@ -1645,6 +1678,11 @@ class Session:
         # defense-in-depth; the cached-side freshness check reads real records,
         # not this, so this is belt-and-suspenders).
         self._anchor_scene_index = dict(meta['anchor_scene_index'])
+        # #4765 follow-up (CoT dedup): persist each message's reasoning once.
+        # Mutates self.messages in place (slimming the live object's RAM too) so
+        # the payload below never re-emits the reasoning_content / api_content
+        # duplicates. Idempotent; a no-op when already slim.
+        _dedupe_session_message_reasoning(self.messages)
         meta['messages'] = self.messages
         meta['tool_calls'] = self.tool_calls
         meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
@@ -1711,6 +1749,17 @@ class Session:
                     except (json.JSONDecodeError, ValueError):
                         existing_msg_count = -1  # corrupt → always back up
                 incoming_msg_count = len(self.messages or [])
+                existing_text = None
+                if existing_msg_count < 0 or existing_msg_count > incoming_msg_count:
+                    # Unknown (legacy/corrupt prefix) or a shrink: we need the
+                    # previous bytes (to back up on shrink) and/or the true count.
+                    existing_text = self.path.read_text(encoding='utf-8')
+                    if existing_msg_count < 0:
+                        try:
+                            _existing_full = json.loads(existing_text)
+                            existing_msg_count = len(_existing_full.get('messages') or [])
+                        except (json.JSONDecodeError, ValueError):
+                            existing_msg_count = -1  # corrupt → force backup below
                 if (
                     existing_msg_count > 0
                     and incoming_msg_count == 0
@@ -1726,6 +1775,8 @@ class Session:
                     )
                     return
                 if existing_msg_count > incoming_msg_count:
+                    if existing_text is None:
+                        existing_text = self.path.read_text(encoding='utf-8')
                     bak_path = self.path.with_suffix('.json.bak')
                     if existing_text is None:
                         # The .bak body is the one thing that needs the full text,
@@ -1813,15 +1864,18 @@ class Session:
         _pre_read_sig = _sidecar_stat_signature(p)
         data = json.loads(p.read_text(encoding='utf-8'))
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+        # #4765 follow-up (CoT dedup): slim any triple-stored reasoning in a
+        # pre-existing sidecar on first full load (see save() for the rules).
+        data['messages'], _deduped_reasoning = _dedupe_session_message_reasoning(data.get('messages'))
         session = cls(**data)
-        if _collapsed_partials:
+        if _collapsed_partials or _deduped_reasoning:
             try:
                 # Self-heal bloated sessions on first full load without touching
                 # recency/index ordering; save() creates a .bak because this
-                # intentionally shrinks the transcript (#2592).
+                # intentionally shrinks the transcript (#2592 / CoT dedup).
                 session.save(touch_updated_at=False, skip_index=True)
             except Exception:
-                logger.debug("Failed to persist collapsed duplicate partials for %s", sid, exc_info=True)
+                logger.debug("Failed to persist slimmed/deduped session for %s", sid, exc_info=True)
         else:
             # #5854: for a LEGACY sidecar (no modern anchor_scene_index key), the
             # cheap metadata-prefix read cannot recover message_count/scenes when
@@ -2829,6 +2883,61 @@ def _partial_message_signature(message: dict) -> tuple:
         str(message.get('reasoning') or '').strip(),
         tuple(tool_sig),
     )
+
+
+def _dedupe_session_message_reasoning(messages) -> tuple[list, bool]:
+    """Store each message's chain-of-thought ONCE (idempotent, mutation-in-place).
+
+    The model's reasoning is persisted redundantly in long sessions:
+
+      * ``reasoning``          — the webui's display-canonical field (the UI dropbar
+        renders from this; the streaming commit writes it).
+      * ``reasoning_content``  — the provider-facing alias, byte-identical to
+        ``reasoning`` in the vast majority of messages (measured 99.8% on a
+        261k-message session).
+      * ``api_content``        — the agent's raw request envelope (prefix + memory
+        context) which re-embeds the CoT a third time. The webui NEVER reads
+        ``api_content`` (zero non-test references); the agent keeps its own copy in
+        state.db for prompt-cache stability.
+
+    On a 261k-message inference session this triple storage is ~1.8 GB of a ~0.7 MB
+    visible conversation, and loading it parses to ~7 GiB RAM — the #4765-family
+    OOM fuel. This dedupes at rest:
+
+      * if both are present and identical -> drop ``reasoning_content``;
+      * if only ``reasoning_content`` is present -> canonicalize it to ``reasoning``
+        and drop the alias (lossless: the display text is preserved verbatim);
+      * if they differ (rare) -> keep BOTH (never lose the provider-facing copy);
+      * drop the ``api_content`` sidecar field entirely (webui never reads it).
+
+    Mutates the message dicts in place and returns ``(messages, changed)`` so the
+    caller can persist the slimmed sidecar. Idempotent: a second pass reports
+    ``changed=False``. Only ``assistant`` messages that carry reasoning text are
+    touched; everything else is left byte-for-byte untouched.
+    """
+    if not isinstance(messages, list):
+        return messages, False
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict) or message.get('role') != 'assistant':
+            continue
+        r = message.get('reasoning')
+        rc = message.get('reasoning_content')
+        if isinstance(rc, str):
+            if isinstance(r, str) and r == rc:
+                if 'reasoning_content' in message:
+                    del message['reasoning_content']
+                    changed = True
+            elif not (isinstance(r, str) and r.strip()):
+                # Only the alias is present -> canonicalize it to the display field.
+                message['reasoning'] = rc
+                if 'reasoning_content' in message:
+                    del message['reasoning_content']
+                changed = True
+        if 'api_content' in message:
+            del message['api_content']
+            changed = True
+    return messages, changed
 
 
 def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
@@ -5168,6 +5277,56 @@ def _session_sidecar_exists(sid) -> bool | None:
 _UNSAVED_SHELL_GRACE_S = 1800
 
 
+def _session_estimated_bytes(s) -> int:
+    """Estimate the resident-memory cost of a cached Session (bytes).
+
+    Used by the size-aware LRU (#4765 follow-up) to bound the *total bytes* the
+    SESSIONS cache may hold, not just its entry count.
+
+    The estimate is derived from the on-disk sidecar size, NOT by walking the
+    (potentially multi-GiB) in-memory object: a session's Python object graph
+    costs roughly 4x its JSON sidecar on disk (dict/str overhead — measured
+    ~7.4 GiB RSS to parse a 1.9 GiB sidecar), so we read the file size and apply
+    a fixed multiplier. This is O(1), allocates nothing, and is stable across
+    restarts (the sidecar is the source of truth for the message history the
+    cache mirrors).
+
+    Sizing rules:
+      * metadata-only stub (``_loaded_metadata_only``): the heavy arrays were never
+        parsed into memory, so charge only a small flat cost (its sidecar is
+        large on disk but cheap in RAM).
+      * no sidecar yet (never persisted): the cache is the only copy, so charge
+        from the in-memory message count (a per-message floor) — conservative,
+        so an unsaved long session is never under-charged and pinned forever.
+      * normal session: sidecar size x ``_SESSIONS_RAM_PER_DISK_BYTE``.
+    """
+    if s is None:
+        return 0
+    if getattr(s, '_loaded_metadata_only', False):
+        return 64 * 1024  # metadata-only stub: tiny resident cost
+    path = getattr(s, 'path', None)
+    if path is not None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size > 0:
+            return int(size * _SESSIONS_RAM_PER_DISK_BYTE)
+    # No (readable) sidecar: fall back to a per-message floor so an unsaved,
+    # never-persisted long session is still charged something (never pinned for
+    # free). 16 KiB per message is a conservative floor for a typical message.
+    msgs = getattr(s, 'messages', None)
+    count = len(msgs) if isinstance(msgs, list) else 0
+    return count * 16 * 1024
+
+
+# Multiplier converting on-disk sidecar bytes to estimated resident RAM. Measured
+# on a real 1.9 GiB sidecar: parsing it peaks at ~7.4 GiB RSS (dict + str overhead
+# ~= 4x the serialized bytes). Used only to *rank* eviction and apply the byte
+# cap; it is intentionally a simple constant, not a live object walk.
+_SESSIONS_RAM_PER_DISK_BYTE = 4.0
+
+
 def _session_is_evictable(s) -> bool:
     """Return True only when *s* can be safely dropped from the LRU (#4765).
 
@@ -5290,23 +5449,41 @@ def _evict_sessions_over_cap(cap: int | None = None) -> int:
     # payload report a cap eviction actually applied — including the getter-failure
     # fallback and explicit/normalized calls, which never reach the resolver (#6351).
     _cfg._LAST_APPLIED_SESSIONS_CACHE_MAX = cap
+    # Size-aware cap (#4765 follow-up): also bound the *total bytes* resident so a
+    # single multi-GiB session (or a set of large ones) cannot pin the process
+    # into OOM even while the entry count is comfortably under ``cap``.
+    try:
+        size_cap = _cfg.get_sessions_cache_size_bytes()
+    except Exception:
+        size_cap = _cfg.DEFAULT_SESSIONS_CACHE_SIZE_BYTES
+    if not isinstance(size_cap, int) or size_cap < 1:
+        size_cap = _cfg.DEFAULT_SESSIONS_CACHE_SIZE_BYTES
+
+    def _total_bytes() -> int:
+        total = 0
+        for _sid, entry in SESSIONS.items():
+            total += _session_estimated_bytes(entry)
+        return total
+
     evicted = 0
     # Iterate over a snapshot of ids in LRU order (oldest first). We stop as
-    # soon as we are at/below the cap. Skipping a non-evictable oldest entry and
-    # moving on lets us reclaim a slightly-newer clean entry instead of blocking
-    # eviction entirely behind one pinned active session.
+    # soon as BOTH the entry count and the total-bytes are at/below their caps.
+    # Skipping a non-evictable oldest entry and moving on lets us reclaim a
+    # slightly-newer clean entry instead of blocking eviction entirely behind one
+    # pinned active session.
     for sid in list(SESSIONS.keys()):
-        if len(SESSIONS) <= cap:
+        if len(SESSIONS) <= cap and _total_bytes() <= size_cap:
             break
         candidate = SESSIONS.get(sid)
         if _session_is_evictable(candidate):
             SESSIONS.pop(sid, None)
             evicted += 1
-    if len(SESSIONS) > cap:
+    if len(SESSIONS) > cap or _total_bytes() > size_cap:
         logger.debug(
-            "SESSIONS cache above cap (%d > %d) after eviction pass: remaining "
-            "entries are active or unsaved and were preserved (#4765)",
-            len(SESSIONS), cap,
+            "SESSIONS cache above cap (%d entries > %d, ~%d bytes > %d) after "
+            "eviction pass: remaining entries are active or unsaved and were "
+            "preserved (#4765)",
+            len(SESSIONS), cap, _total_bytes(), size_cap,
         )
     return evicted
 

@@ -10775,6 +10775,40 @@ def get_sessions_cache_max(config_data: dict | None = None) -> int:
 # dict mode, which reads no file and takes no lock, so the value is right before
 # the first eviction pass instead of after it.
 _LAST_APPLIED_SESSIONS_CACHE_MAX: int = get_sessions_cache_max(cfg)
+
+# Byte cap for the in-memory SESSIONS cache (issue #4765 follow-up: size-aware LRU).
+# The entry-count cap above bounds *how many* sessions may be resident, but not
+# *how big* the resident set is. A single very long session (hundreds of thousands
+# of messages) parses to several GiB of Python objects and, while pinned as an
+# active/unsaved entry, cannot be evicted — so the count cap never bounds it and a
+# long-running install can thrash into OOM (the #4765/#2233/#4633 crash cluster).
+# This adds a total-bytes bound so the resident set sheds idle sessions by size.
+# Precedence mirrors get_sessions_cache_max():
+#   1. config.yaml  webui.sessions_cache_size_bytes   (preferred, no new env var)
+#   2. DEFAULT_SESSIONS_CACHE_SIZE_BYTES             (sane bounded default)
+DEFAULT_SESSIONS_CACHE_SIZE_BYTES = 3 * 1024 * 1024 * 1024
+
+
+def get_sessions_cache_size_bytes(config_data: dict | None = None) -> int:
+    """Return the effective in-memory SESSIONS cache byte cap (#4765 size-aware LRU).
+
+    Bounds the *total estimated resident bytes* of the SESSIONS LRU in addition to
+    the entry-count cap. A missing / empty / non-numeric / below-1 value falls back
+    to the bounded default so a typo can never disable the bound.
+    """
+    active_cfg = config_data if isinstance(config_data, dict) else get_config()
+    webui_cfg = active_cfg.get("webui", {}) if isinstance(active_cfg, dict) else {}
+    if isinstance(webui_cfg, dict):
+        raw = webui_cfg.get("sessions_cache_size_bytes")
+        if raw is not None:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value >= 1:
+                return value
+    return DEFAULT_SESSIONS_CACHE_SIZE_BYTES
+
 CHAT_LOCK = threading.Lock()
 
 
