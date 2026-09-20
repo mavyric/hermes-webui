@@ -188,6 +188,19 @@ def test_check_repo_reports_manual_update_for_baked_webui_version(tmp_path, monk
     monkeypatch.setattr(updates.urllib.request, 'urlopen', fake_urlopen)
     monkeypatch.setattr(updates, 'WEBUI_VERSION', 'v0.51.833')
 
+    # The compare URL and tags source are now derived from ``origin`` (a
+    # personal fork that mirrors upstream). Make that origin deterministic so
+    # the assertions below are stable regardless of the checkout's real remote.
+    fake_origin = 'https://x-access-token:***@github.com/mavyric/hermes-webui.git'
+    real_run_git = updates._run_git
+
+    def fake_run_git(args, cwd, timeout=10):
+        if list(args) == ['remote', 'get-url', 'origin']:
+            return fake_origin, True
+        return real_run_git(args, cwd, timeout=timeout)
+
+    monkeypatch.setattr(updates, '_run_git', fake_run_git)
+
     info = updates._check_repo(tmp_path, 'webui')
 
     assert info['name'] == 'webui'
@@ -200,9 +213,11 @@ def test_check_repo_reports_manual_update_for_baked_webui_version(tmp_path, monk
     assert info['current_sha'] == 'current-sha'
     assert info['latest_sha'] == 'stable-sha'
     assert info['compare_url'] == (
-        'https://github.com/nesquena/hermes-webui/compare/current-sha...stable-sha'
+        'https://github.com/mavyric/hermes-webui/compare/current-sha...stable-sha'
     )
-    assert seen['url'] == 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
+    # Token-bearing origin must NOT leak into the tags API URL.
+    assert seen['url'] == 'https://api.github.com/repos/mavyric/hermes-webui/tags?per_page=100'
+    assert '@' not in seen['url']
     assert seen['timeout'] == 3.0
 
 

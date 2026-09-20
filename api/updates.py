@@ -649,6 +649,14 @@ def _normalize_remote_url(remote_url):
     remote_url = remote_url.strip()
     if remote_url.startswith('git@'):
         remote_url = remote_url.replace(':', '/', 1).replace('git@', 'https://', 1)
+    # Strip embedded credentials (e.g. ``https://x-access-token:***@github.com/...``)
+    # so authenticated remotes (personal forks, GITHUB_TOKEN-mirrored origins)
+    # never leak their token into the update payload, compare URLs, or logs.
+    if '://' in remote_url:
+        scheme, rest = remote_url.split('://', 1)
+        if '@' in rest:
+            rest = rest.rsplit('@', 1)[1]
+        remote_url = f'{scheme}://{rest}'
     remote_url = remote_url.rstrip('/')
     if remote_url.endswith('.git'):
         remote_url = remote_url[:-4]
@@ -846,8 +854,29 @@ def _is_stable_release_tag(tag):
     return bool(_RELEASE_TAG_RE.fullmatch(raw) and '-' not in raw[1:])
 
 
-def _github_release_tags(url='https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100', *, timeout=3.0):
-    """Return GitHub release tags newest-first, including commit SHAs when available."""
+def _github_release_tags(url=None, *, timeout=3.0):
+    """Return GitHub release tags newest-first, including commit SHAs when available.
+
+    ``url`` may be omitted; the release source is then derived from the
+    ``origin`` remote of this checkout (a personal fork that mirrors
+    upstream's tags) so the banner tracks the repo we actually pull from.
+    Falls back to the canonical upstream repository when origin cannot be
+    resolved.
+    """
+    if not url:
+        base = _normalize_remote_url(
+            _run_git(['remote', 'get-url', 'origin'], REPO_ROOT)[0]
+        )
+        # Convert a web URL (https://github.com/owner/repo) to the tags API.
+        # Personal forks mirror upstream's release tags, so origin is the
+        # correct source; fall back to canonical upstream if unresolvable.
+        repo_path = base
+        if repo_path.startswith('https://github.com/'):
+            repo_path = repo_path[len('https://github.com/'):]
+        if repo_path.strip('/') and '/' in repo_path:
+            url = f'https://api.github.com/repos/{repo_path.strip("/")}/tags?per_page=100'
+        else:
+            url = 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
     request = urllib.request.Request(
         url,
         headers={
@@ -906,7 +935,14 @@ def _check_webui_published_release_update():
     current = next((item for item in tags if item['name'] == current_version), None) or {}
     current_ref = current.get('sha') or current_version
     latest_ref = latest.get('sha') or latest_version
-    repo_url = 'https://github.com/nesquena/hermes-webui'
+    # Compare URLs point at the repo we actually pull from (origin — a
+    # personal fork that mirrors upstream), not the hardcoded upstream.
+    _origin_url = _normalize_remote_url(
+        _run_git(['remote', 'get-url', 'origin'], REPO_ROOT)[0]
+    )
+    if not _origin_url.startswith('https://github.com/'):
+        _origin_url = 'https://github.com/nesquena/hermes-webui'
+    repo_url = _origin_url
     return {
         'name': 'webui',
         'behind': behind,
