@@ -112,6 +112,23 @@ class TestUiJsThinkingGate:
             "_appendWorklogReason must not build a reasoning row when thinking is hidden"
         )
 
+    def test_has_cot_marker_is_renderable_reasoning_anchor(self):
+        """A CoT-only row (reasoning moved to <sid>.cot, only _has_cot left) must
+        be a renderable reasoning anchor. Without this, a window of CoT-only rows
+        (e.g. R9V's tail of thinking-only turns) collapses to zero visible rows and
+        the session opens on the empty-state welcome screen."""
+        src = read('static/ui.js')
+        body = function_body(src, "_messageHasReasoningPayload")
+        assert 'm._has_cot' in body, (
+            "_messageHasReasoningPayload must treat the _has_cot marker as a "
+            "reasoning payload so CoT-only rows stay renderable"
+        )
+        # The marker check must come BEFORE the inline-field checks (it is the
+        # canonical lazy store) and must return true for assistant rows.
+        assert re.search(r"if\(m\._has_cot\)\s*return true;", body), (
+            "_messageHasReasoningPayload must return true when m._has_cot is set"
+        )
+
     def test_show_thinking_gate_does_not_hide_worklog_anchor_text(self):
         src = read('static/ui.js')
         html_fn = function_body(src, "_worklogReasonHtmlFromText")
