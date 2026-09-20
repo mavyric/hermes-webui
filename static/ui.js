@@ -11716,11 +11716,7 @@ function _fmtDateSep(d){
 const _ERR_MSG_RE=/^(?:\*\*error\b|error:|connection lost|no response received)/i;
 function _messageHasReasoningPayload(m){
   if(!m||m.role!=='assistant') return false;
-  // #4765 follow-up (CoT side-store): lazily-stored reasoning lives in
-  // <sid>.cot; the sidecar row carries only the _has_cot marker. Treat it as
-  // a reasoning anchor so CoT-only rows stay renderable (collapsed Thinking
-  // card) — without this, a window of CoT-only rows renders zero visible rows
-  // and the session opens on the empty state.
+  // #4765 follow-up: CoT lives in <sid>.cot; the _has_cot marker is a reasoning anchor so CoT-only rows render as lazy Thinking cards.
   if(m._has_cot) return true;
   if(m.reasoning||m.reasoning_content||m.thinking||m._reasoning) return true;
   if(Array.isArray(m.content)) return m.content.some(p=>p&&(p.type==='thinking'||p.type==='reasoning'));
