@@ -11819,7 +11819,19 @@ function _assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, vis
   return false;
 }
 function _assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs){
+  // #4765 follow-up (CoT side-store): a lazily-stored reasoning marker counts
+  // as thinking for worklog bucketing even though no text is inline.
+  if(m&&m._has_cot) return true;
   return !!_assistantReasoningPayloadText(m)||_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs);
+}
+// #4765 follow-up (CoT side-store): unique per-message placeholder for a
+// lazily-stored reasoning text. Drives the collapsed Thinking card + worklog
+// step; the real text is fetched from /api/session/reasoning on first expand
+// and stashed on the message (m._reasoning) so re-renders are free.
+function _cotLazyPlaceholder(m, rawIdx){
+  if(m&&m._reasoning&&String(m._reasoning).trim()) return String(m._reasoning);
+  const off=(typeof _oldestIdx!=='undefined'&&Number.isFinite(Number(_oldestIdx)))?Number(_oldestIdx)||0:0;
+  return `_COT_LAZY:${rawIdx+off}:${rawIdx}`;
 }
 function _assistantReasoningPayloadText(m){
   if(!m||m.role!=='assistant') return '';
@@ -12098,6 +12110,67 @@ function _thinkingActivityNode(text, open, disclosureKey){
   row.innerHTML=_thinkingCardHtml(text, open);
   _renderThinkingInto(row,text);
   return row;
+}
+// ── #4765 follow-up (CoT side-store): lazy reasoning fetch ─────────────────
+// Assistant messages whose reasoning was moved out of the session sidecar
+// arrive as a `_has_cot` marker. The render pass stamps their Thinking card
+// with data-cot-lazy + the windowed message index; on first expand this
+// fetches the text from /api/session/reasoning (O(1) file seek server-side)
+// and fills the card. The text is stashed on the message (m._reasoning) so
+// re-renders show it without another fetch.
+function _isCotLazyThinkingText(text){
+  return String(text||'').indexOf('_COT_LAZY:')===0;
+}
+// windowIdx is the index into the CURRENTLY RENDERED window (S.messages).
+// The helper resolves it to the absolute full-array index at render time
+// (windowIdx + _oldestIdx), so persisted scenes and re-renders from any
+// window position all carry the correct stable fetch target.
+function _stampCotLazyThinkingCard(node, windowIdx){
+  if(!node||typeof windowIdx!=='number'||!Number.isFinite(windowIdx)||windowIdx<0) return;
+  const off=(typeof _oldestIdx!=='undefined'&&Number.isFinite(Number(_oldestIdx)))?Number(_oldestIdx)||0:0;
+  const card=node.classList&&node.classList.contains('thinking-card')
+    ? node
+    : (node.querySelector?node.querySelector('.thinking-card'):null);
+  if(!card) return;
+  card.dataset.cotLazy='1';
+  card.dataset.cotAbsIdx=String(windowIdx+off);
+}
+function _fetchCotForCard(card){
+  if(!card||card.dataset.cotFetched||card.dataset.cotFetching) return;
+  const sid=(typeof S!=='undefined'&&S.session&&S.session.session_id)||'';
+  const fullIdx=Number(card.dataset.cotAbsIdx);
+  if(!sid||!Number.isFinite(fullIdx)) return;
+  if(typeof api!=='function') return;
+  card.dataset.cotFetching='1';
+  api(`/api/session/reasoning?session_id=${encodeURIComponent(sid)}&indices=${fullIdx}`,{method:'GET',timeoutMs:8000}).then((d)=>{
+    const text=(d&&d.reasoning)?d.reasoning[String(fullIdx)]:'';
+    if(typeof text==='string'&&String(text).trim()){
+      const pre=card.querySelector('.thinking-card-body pre');
+      if(pre) pre.textContent=(typeof _sanitizeThinkingDisplayText==='function')?_sanitizeThinkingDisplayText(text):text;
+      // Stash on the windowed message (rawIdx = absIdx - window offset) so
+      // re-renders show the fetched text without another request.
+      const off=(typeof _oldestIdx!=='undefined'&&Number.isFinite(Number(_oldestIdx)))?Number(_oldestIdx)||0:0;
+      const msg=(typeof S!=='undefined'&&Array.isArray(S.messages))?S.messages[fullIdx-off]:null;
+      if(msg) msg._reasoning=text;
+      card.dataset.cotFetched='1';
+    }else{
+      delete card.dataset.cotFetching;
+    }
+  }).catch(()=>{
+    delete card.dataset.cotFetching;
+  });
+}
+// Expand detection: the card header's inline onclick toggles the 'open'
+// class synchronously on click, so a document-level click delegate is enough
+// (no global MutationObserver — class churn in this app is high-frequency).
+if(typeof document!=='undefined'){
+  document.addEventListener('click',(e)=>{
+    const t=e&&e.target;
+    if(!t||!t.closest) return;
+    const card=t.closest('.thinking-card[data-cot-lazy="1"]');
+    if(!card) return;
+    if(card.classList.contains('open')&&!card.dataset.cotFetched) _fetchCotForCard(card);
+  },true);
 }
 function chatActivityMode(){
   if(typeof window==='undefined') return 'compact_worklog';
@@ -13461,6 +13534,9 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
     if(!seenReasons||!seenReasons.has(thinkingKey)){
       const thinking=_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey);
       if(thinking){
+        if(typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(thinkingText)&&anchor&&anchor.dataset){
+          _stampCotLazyThinkingCard(thinking, Number(anchor.dataset.msgIdx));
+        }
         list.appendChild(thinking);
         wroteProse=true;
         if(seenReasons) seenReasons.add(thinkingKey);
@@ -13652,6 +13728,9 @@ function _anchorSceneNodeForRow(row, opts){
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
     if(!text) return null;
     node=_thinkingActivityNode(text, false, row.row_id||row.local_id||'anchor-thinking');
+    if(typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(text)&&row&&row.group&&Number.isFinite(row.group.assistant_msg_idx)){
+      _stampCotLazyThinkingCard(node, row.group.assistant_msg_idx);
+    }
   }else if(row.role==='tool'){
     node=buildToolCard(_anchorSceneToolCallFromRow(row,opts));
   }else if(row.role==='lifecycle'){
@@ -13734,6 +13813,9 @@ function _anchorSceneTransparentNodeForRow(row, opts){
       ...meta,
       live,
     });
+    if(typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(text)&&row&&row.group&&Number.isFinite(row.group.assistant_msg_idx)){
+      _stampCotLazyThinkingCard(node, row.group.assistant_msg_idx);
+    }
   }else if(row.role==='tool'){
     const toolCall=_anchorSceneToolCallFromRow(row,{settled});
     node=_decorateTransparentEventRow(buildToolCard(toolCall),{
@@ -17824,6 +17906,15 @@ function renderMessages(options){
       const turnVisibleContents=assistantTurnVisibleContentByRawIdx.get(rawIdx)||[];
       thinkingText=_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent, turnFinalVisibleContent, turnVisibleContents);
     }
+    // #4765 follow-up (CoT side-store): the reasoning text was moved out of
+    // the sidecar (the message carries only a _has_cot marker). Surface a
+    // UNIQUE per-message placeholder so the turn still renders a collapsed
+    // Thinking card that fetches the text on first expand. Without this,
+    // CoT-only messages paint blank (the #4765 R9V symptom — 261k reasoning-
+    // only rows, 0 visible text).
+    if(!isUser&&m&&m._has_cot&&!thinkingText){
+      thinkingText=_cotLazyPlaceholder(m, rawIdx);
+    }
     const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
     const nextRendered=renderVisWithIdx[vi+1];
     const isTurnFinalAssistant=!isUser&&(!nextRendered||!nextRendered.m||nextRendered.m.role!=='assistant');
@@ -18064,7 +18155,11 @@ function renderMessages(options){
         if(m._activityBurstId!==undefined&&m._activityBurstId!==null) orderedSeg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
         if(Number.isFinite(Number(m._liveSegmentSeq))) orderedSeg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
         if(_ERR_MSG_RE.test(String(partDisplayText||'').trim())) orderedSeg.dataset.error='1';
-        if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))) orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+        if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))){
+          orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+          const _ocEl=orderedSeg.querySelector('.thinking-card');
+          if(_ocEl&&typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(thinkingText)) _stampCotLazyThinkingCard(_ocEl, rawIdx);
+        }
         const isLastTextPart=partIdx===lastTextPartIdx;
         const partBodyHtml=_getCachedRender(partDisplayText,false);
         // Message-level media snapshots: transparent ordered segments carry the
@@ -18130,7 +18225,11 @@ function renderMessages(options){
     }
     if(thinkingText&&window._showThinking!==false){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
-      else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+      else if(window._showThinking!==false){
+        const _thCard=seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
+        const _thCardEl=seg.querySelector('.thinking-card');
+        if(_thCardEl&&typeof _isCotLazyThinkingText==='function'&&_isCotLazyThinkingText(thinkingText)) _stampCotLazyThinkingCard(_thCardEl, rawIdx);
+      }
     }
     const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);
     if(statusHtml){

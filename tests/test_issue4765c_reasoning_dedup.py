@@ -228,11 +228,17 @@ def test_load_self_heals_bloated_sidecar(isolated_session_env):
     raw = json.loads(path.read_text(encoding="utf-8"))
     after = len(json.dumps(raw, ensure_ascii=False))
     assert after < before, "sidecar did not shrink after self-heal"
+    from api import cot_store
     for m in raw["messages"]:
         if m.get("role") == "assistant":
             assert "reasoning_content" not in m
             assert "api_content" not in m
-            assert m["reasoning"]  # CoT preserved
+            # #4765 follow-up: CoT text now lives in the side store, not inline.
+            assert "reasoning" not in m
+            assert m["_has_cot"] is True
+    # Side store carries the preserved CoT verbatim.
+    recs = cot_store.read_records(isolated_session_env, "bloated001", list(range(1, n)))
+    assert recs[1] == "think 0" and recs[n - 1] == f"think {n - 2}"
     # .bak is allowed (intentional shrink) and must retain the pre-shrink text.
     bak = path.with_suffix(".json.bak")
     if bak.exists():

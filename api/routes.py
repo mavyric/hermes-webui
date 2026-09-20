@@ -9287,6 +9287,14 @@ def _display_merge_session_is_active(session) -> bool:
     )
 
 
+def _display_merge_probe_diag_miss(reason: str, sid: str = "?") -> None:
+    """Temporary: trace display-merge cache probe misses to the journal."""
+    try:
+        print("[display-merge-probe] MISS reason=%s sid=%s" % (reason, sid), flush=True)
+    except Exception:
+        pass
+
+
 def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None):
     """Return the memoized merged transcript, or None when it can't be reused.
 
@@ -9301,13 +9309,16 @@ def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None
     then performs the normal full load + merge.
     """
     if msg_before is not None or _display_merge_session_is_active(session):
+        _display_merge_probe_diag_miss("active_or_msg_before", sid=getattr(session, "session_id", "?"))
         return None
     sid = str(getattr(session, "session_id", "") or "")
     if not sid:
+        _display_merge_probe_diag_miss("no_sid")
         return None
     with _display_merge_cache_lock:
         entry = _display_merge_cache.get(sid)
         if entry is None:
+            _display_merge_probe_diag_miss("no_entry", sid)
             return None
     # Resolve the sidecar exactly like the merge helper does: it treats None as
     # "load the lineage myself", and the cache entry was keyed on that RESOLVED
@@ -9322,10 +9333,14 @@ def _display_merge_cached_messages(session, sidecar_messages, *, msg_before=None
     # asymmetry is the whole point.
     cache_key = _display_merge_cache_key(session, sidecar_messages, None)
     if cache_key is None:
+        _display_merge_probe_diag_miss("key_none", sid)
         return None
     with _display_merge_cache_lock:
         entry = _display_merge_cache.get(sid)
         if not _display_merge_cache_entry_usable(entry, cache_key):
+            _display_merge_probe_diag_miss(
+                "key_mismatch", sid,
+            )
             return None
         _display_merge_cache.move_to_end(sid, last=True)
         return [dict(m) if isinstance(m, dict) else m for m in entry["messages"]]
@@ -14558,6 +14573,51 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/session":
         return _handle_session_get(handler, parsed)
+
+    if parsed.path == "/api/session/reasoning":
+        # #4765 follow-up (CoT side-store): lazily fetch stored reasoning for
+        # specific message indices. The main session payload carries only a
+        # ``_has_cot`` marker per assistant message; the frontend expands the
+        # thinking card by fetching the text here — O(k) file seeks instead of
+        # materialising the whole session's CoT into RAM on open.
+        q = parse_qs(parsed.query)
+        sid = (q.get("session_id", [""])[0] or "").strip()
+        if not sid:
+            return bad(handler, "Missing session_id")
+        if not is_safe_session_id(sid):
+            return bad(handler, "Invalid session_id", 400)
+        # Profile gate mirrors /api/session: the detail-load route owns profile
+        # mismatch handling; a foreign session is 404, not 200-with-data.
+        if not _session_id_visible_to_request_profile(handler, sid, emit_error=False):
+            return bad(handler, "Session not found", 404)
+        raw_indices = (q.get("indices", [""])[0] or "").strip()
+        indices = None
+        if raw_indices:
+            try:
+                indices = [int(x) for x in raw_indices.split(",") if x.strip() != ""]
+            except ValueError:
+                return bad(handler, "indices must be comma-separated integers", 400)
+        if not indices:
+            # Requiring indices keeps this endpoint O(k) — a bare request
+            # (the whole session) is the case the side store exists to avoid.
+            return bad(handler, "indices required", 400)
+        try:
+            from api import cot_store
+            # Read straight from the side store (index + O(k) seeks). Deliberately
+            # NO session load: the whole point is that opening a session must not
+            # materialise its CoT into RAM, and fetching one expanded card must
+            # not load the 261k-message sidecar just to reach it.
+            records = cot_store.read_records(
+                SESSION_DIR, sid, indices if indices is not None else None,
+            )
+        except Exception:
+            logger.debug("CoT fetch failed for %s", sid, exc_info=True)
+            return bad(handler, "Failed to load stored reasoning", 500)
+        j(handler, {
+            "session_id": sid,
+            "reasoning": {str(i): text for i, text in records.items()},
+        })
+        return True
 
     if parsed.path == "/api/session/lineage/report":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
@@ -25464,6 +25524,7 @@ def _handle_chat_sync(handler, body):
                     effective_model=_model,
                     effective_provider=_provider,
                     effective_base_url=_base_url,
+                    session_id=s.session_id,
                 ),
                 task_id=s.session_id,
                 persist_user_message=msg,
@@ -28032,7 +28093,7 @@ def _handle_session_compress(handler, body):
     try:
         from api.streaming import _sanitize_messages_for_api
 
-        messages = _sanitize_messages_for_api(s.messages)
+        messages = _sanitize_messages_for_api(s.messages, session_id=s.session_id)
         if len(messages) < 4:
             return bad(handler, "Not enough conversation to compress (need at least 4 messages).")
 
@@ -28199,7 +28260,7 @@ def _handle_session_compress(handler, body):
             )
             if current_stream_state != original_stream_state:
                 return bad(handler, "Session stream state changed during compression; please retry.", 409)
-            if _sanitize_messages_for_api(s.messages) != original_messages:
+            if _sanitize_messages_for_api(s.messages, session_id=s.session_id) != original_messages:
                 return bad(handler, "Session was modified during compression; please retry.", 409)
 
             from api.session_ops import _truncation_watermark_for

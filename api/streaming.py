@@ -6089,6 +6089,7 @@ def _sanitize_messages_for_api(
     effective_base_url: str | None = None,
     preserve_api_content: bool = False,
     requested_provider: str = "",
+    session_id: str | None = None,
 ):
     """Return a deep copy of messages with only API-safe fields.
 
@@ -6120,6 +6121,9 @@ def _sanitize_messages_for_api(
         # here because direct provider/compression projections must continue to
         # reject unknown bookkeeping fields.
         allowed_keys = _API_SAFE_MSG_KEYS | {"api_content"}
+    # #4765 follow-up (CoT side-store): lazily-stored reasoning is rehydrated
+    # ONCE per projection so the model sees the pre-side-store history.
+    _cot_map = _cot_rehydration_map(messages, session_id)
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
     valid_tool_call_ids: set = set()
@@ -6135,7 +6139,7 @@ def _sanitize_messages_for_api(
 
     # Second pass: build the sanitized list, dropping orphaned tool messages.
     clean = []
-    for msg in messages:
+    for _idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         # Skip display-only Thinking entries. They are visible transcript
@@ -6175,12 +6179,16 @@ def _sanitize_messages_for_api(
             sanitized.pop("api_content", None)
         elif not isinstance(sanitized.get("api_content"), str) or not sanitized.get("api_content"):
             sanitized.pop("api_content", None)
-        # #4765 follow-up (CoT dedup): the sidecar now stores reasoning once, in
-        # the display-canonical ``reasoning`` field. Providers that replay
-        # historical CoT read the ``reasoning_content`` alias (in
-        # _API_SAFE_MSG_KEYS), so project it from ``reasoning`` when the alias
-        # isn't present — keeping the model-facing history identical to the
-        # pre-dedup layout.
+        # #4765 follow-up (CoT side-store): rehydrate lazily-stored reasoning
+        # BEFORE the reasoning_content projection so the model sees the
+        # pre-side-store history (display text unchanged either way).
+        if (
+            msg.get('role') == 'assistant'
+            and msg.get('_has_cot')
+            and _cot_map
+            and _idx in _cot_map
+        ):
+            msg = dict(msg, reasoning=_cot_map[_idx])
         if (
             msg.get('role') == 'assistant'
             and 'reasoning_content' not in sanitized
@@ -6279,6 +6287,7 @@ def _sanitize_messages_for_agent(
     effective_provider: str | None = None,
     effective_base_url: str | None = None,
     requested_provider: str = "",
+    session_id: str | None = None,
 ):
     """Build the internal Agent replay projection with ``api_content`` intact.
 
@@ -6295,7 +6304,34 @@ def _sanitize_messages_for_agent(
         effective_base_url=effective_base_url,
         preserve_api_content=True,
         requested_provider=requested_provider,
+        session_id=session_id,
     )
+
+
+def _cot_rehydration_map(messages, session_id):
+    """Return {original_index: reasoning_text} for lazily-stored CoT.
+
+    After the #4765 CoT side-store, assistant messages persist their
+    reasoning in ``<sid>.cot`` and carry only a ``_has_cot`` marker. Model
+    replay must see the same history as before the side-store: this maps the
+    marker positions back to their stored text in one bulk read (O(k) seeks,
+    independent of session size). Returns {} when no rehydration is needed;
+    failures fail closed to {} (CoT omitted, transcript intact).
+    """
+    wanted = [
+        i
+        for i, m in enumerate(messages)
+        if isinstance(m, dict) and m.get("_has_cot")
+    ]
+    if not wanted or not session_id:
+        return {}
+    try:
+        from api import cot_store
+        from api.models import SESSION_DIR
+        return cot_store.read_records(SESSION_DIR, str(session_id), wanted)
+    except Exception:
+        logger.debug("CoT rehydration failed for %s", session_id, exc_info=True)
+        return {}
 
 
 def _api_safe_message_positions(messages):
@@ -11964,6 +12000,7 @@ def _run_agent_streaming(
                     effective_provider=resolved_provider,
                     effective_base_url=resolved_base_url,
                     requested_provider=(_session_requested_provider or ""),
+                    session_id=session_id,
                 ),
                 conversation_history_revision=_conversation_history_revision,
                 task_id=session_id,
@@ -12557,6 +12594,7 @@ def _run_agent_streaming(
                                         effective_provider=resolved_provider,
                                         effective_base_url=resolved_base_url,
                                         requested_provider=(_session_requested_provider or ""),
+                                        session_id=session_id,
                                     ),
                                     conversation_history_revision=(
                                         _heal_conversation_history_revision
@@ -13924,6 +13962,7 @@ def _run_agent_streaming(
                                 effective_provider=resolved_provider,
                                 effective_base_url=resolved_base_url,
                                 requested_provider=(_session_requested_provider or ""),
+                                session_id=session_id,
                             ),
                             conversation_history_revision=(
                                 _heal_conversation_history_revision

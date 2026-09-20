@@ -1821,6 +1821,19 @@ class Session:
             except Exception:
                 pass
             raise
+        # #4765 follow-up (CoT side-store): keep <sid>.cot in lockstep with the
+        # messages just written. Fast paths: no-op when counts match and no
+        # inline reasoning (the lazy-stripped steady state), tail-append for a
+        # normal conversation grow (the new messages' inline CoT is copied to
+        # the store). A shrink/rebuild (compaction) falls back to a full
+        # rebuild there. Best-effort: the sidecar is the source of truth for
+        # display, the store only backs the lazy CoT fetch + model replay.
+        try:
+            from api import cot_store
+            if self.session_id and isinstance(self.messages, list) and self.messages:
+                cot_store.sync(SESSION_DIR, self.session_id, self.messages)
+        except Exception:
+            logger.debug("CoT side-store sync failed for %s", self.session_id, exc_info=True)
         if not skip_index:
             _write_session_index(updates=[self])
 
@@ -1868,15 +1881,57 @@ class Session:
         # pre-existing sidecar on first full load (see save() for the rules).
         data['messages'], _deduped_reasoning = _dedupe_session_message_reasoning(data.get('messages'))
         session = cls(**data)
-        if _collapsed_partials or _deduped_reasoning:
+        # #4765 follow-up (CoT dedup + side-store): slim any triple-stored
+        # reasoning in a pre-existing sidecar, then move the canonical CoT
+        # text OUT of the sidecar into <sid>.cot so the display path never
+        # carries it in RAM. Legacy sidecars (inline reasoning) are migrated
+        # on first full load: extract -> strip -> persist. Idempotent; a
+        # no-op when the store already matches (same count, no inline
+        # reasoning) and the sidecar is already slim.
+        if not getattr(session, "_loaded_metadata_only", False):
+            _needs_persist = bool(_collapsed_partials or _deduped_reasoning)
+            _msgs = session.messages
+            if isinstance(_msgs, list) and _msgs and any(
+                isinstance(m, dict)
+                and isinstance(m.get("reasoning"), str)
+                and m["reasoning"].strip()
+                for m in _msgs
+            ):
+                from api import cot_store
+                cot_store.write_full(SESSION_DIR, sid, _msgs)
+                _stripped_cot = False
+                for m in _msgs:
+                    if isinstance(m, dict):
+                        r = m.get("reasoning")
+                        if isinstance(r, str) and r.strip():
+                            # Rehydrate via /api/session/reasoning on expand;
+                            # the marker drives the collapsed thinking card so
+                            # the row still renders as a thought.
+                            m["_has_cot"] = True
+                            del m["reasoning"]
+                            _stripped_cot = True
+                _needs_persist = _needs_persist or _stripped_cot
             try:
-                # Self-heal bloated sessions on first full load without touching
-                # recency/index ordering; save() creates a .bak because this
-                # intentionally shrinks the transcript (#2592 / CoT dedup).
-                session.save(touch_updated_at=False, skip_index=True)
+                if _needs_persist:
+                    # Self-heal bloated sessions on first full load without
+                    # touching recency/index ordering; save() creates a .bak
+                    # because this intentionally shrinks the transcript
+                    # (#2592 / CoT dedup).
+                    session.save(touch_updated_at=False, skip_index=True)
             except Exception:
-                logger.debug("Failed to persist slimmed/deduped session for %s", sid, exc_info=True)
-        else:
+                logger.debug(
+                    "Failed to persist slimmed/deduped session for %s", sid, exc_info=True,
+                )
+            if not (_collapsed_partials or _deduped_reasoning):
+                # Steady state (nothing slimmed): keep the store in sync with
+                # the loaded messages (no-op when already consistent).
+                try:
+                    from api import cot_store
+                    if isinstance(_msgs, list) and _msgs:
+                        cot_store.sync(SESSION_DIR, sid, _msgs)
+                except Exception:
+                    logger.debug("CoT side-store migration failed for %s", sid, exc_info=True)
+        if not (_collapsed_partials or _deduped_reasoning):
             # #5854: for a LEGACY sidecar (no modern anchor_scene_index key), the
             # cheap metadata-prefix read cannot recover message_count/scenes when
             # scenes serialize before them, so cache the authoritative facts we

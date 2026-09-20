@@ -3514,6 +3514,19 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const reasoning=_anchorSceneMessageReasoningText(message);
       if(_anchorSceneCleanText(reasoning)&&_anchorSceneTextKey(reasoning)!==_anchorSceneTextKey(text)){
         pool.push({..._anchorSceneThinkingRow(reasoning,0,idx),_phase:0,_encounter:encounter++});
+      }else if(message._has_cot){
+        // #4765 follow-up (CoT side-store): the reasoning text was moved out of
+        // the sidecar (it arrives as a ``_has_cot`` marker). Render a lazy
+        // Thinking row now; the card fetches the text on first expand. The
+        // placeholder embeds the ABSOLUTE message index (window offset
+        // applied) so the fetch target stays correct when the row survives
+        // into a persisted scene and re-renders from another window, and the
+        // unique tail keeps per-turn text-key dedupe honest (N CoT-only
+        // messages must not collapse into one card).
+        const _absIdx=_anchorSceneAbsoluteMessageIndexForPersist(idx,_anchorSceneMessageOffsetForPersist());
+        const row=_anchorSceneThinkingRow(`_COT_LAZY:${_absIdx}:${encounter}`,0,idx);
+        row._cot_lazy=true;
+        pool.push({...row,_phase:0,_encounter:encounter++});
       }
       const messageTools=[];
       if(Array.isArray(message.tool_calls)) messageTools.push(...message.tool_calls);
