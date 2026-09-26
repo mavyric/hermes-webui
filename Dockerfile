@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 LABEL maintainer="nesquena"
 LABEL description="Hermes Web UI — browser interface for Hermes Agent"
@@ -31,7 +31,7 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── SQLite upgrade ──────────────────────────────────────────────────────────
-# The python:3.12-slim base ships SQLite 3.46.1 (Debian Trixie), which is
+# The python:3.14-slim base ships SQLite 3.46.1 (Debian Trixie), which is
 # vulnerable to the WAL-reset corruption bug discovered March 2026.
 # https://sqlite.org/wal.html#walresetbug
 #

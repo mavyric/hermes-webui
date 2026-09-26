@@ -17,6 +17,7 @@ archive/
 .env.*
 !.env.example
 !.env.docker.example
+docker-compose.override.yml
 .claude/
 CLAUDE.md
 AGENTS.local.md
